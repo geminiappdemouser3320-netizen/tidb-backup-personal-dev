@@ -84,6 +84,45 @@ func setLockTTL(v uint64) lockTTL { return lockTTL(atomic.SwapUint64(&transactio
 
 func (v lockTTL) restore() { atomic.StoreUint64(&transaction.ManagedLockTTL, uint64(v)) }
 
+// TestPessimisticLockHeldAcrossRegionSplit checks an already acquired lock,
+// not a split racing with an in-flight pessimistic-lock RPC.
+func TestPessimisticLockHeldAcrossRegionSplit(t *testing.T) {
+	if !*realtikvtest.WithRealTiKV {
+		t.Skip("requires real TiKV region splitting")
+	}
+	store := realtikvtest.CreateMockStoreAndSetup(t)
+	tk := testkit.NewTestKit(t, store)
+	// Separate sessions keep the lock owner, competing writer, and split DDL independent.
+	owner := testkit.NewTestKit(t, store)
+	contender := testkit.NewTestKit(t, store)
+	for _, session := range []*testkit.TestKit{tk, owner, contender} {
+		session.MustExec("use test")
+	}
+	tk.MustExec("drop table if exists pessimistic_split_lock")
+	tk.MustExec("create table pessimistic_split_lock (id int primary key clustered, v int)")
+	t.Cleanup(func() {
+		owner.MustExec("rollback")
+		contender.MustExec("rollback")
+		tk.MustExec("drop table if exists pessimistic_split_lock")
+	})
+	tk.MustExec("insert into pessimistic_split_lock values (1, 10), (100, 20)")
+	contender.MustExec("set innodb_lock_wait_timeout = 1")
+	owner.MustExec("begin pessimistic")
+	owner.MustQuery("select v from pessimistic_split_lock where id = 100 for update").Check(testkit.Rows("20"))
+	// Put the locked row in the right-hand child region while its transaction stays open.
+	tk.MustQuery("split table pessimistic_split_lock by (50)").Check(testkit.Rows("1 1"))
+	contender.MustExec("begin pessimistic")
+	err := contender.ExecToErr("update pessimistic_split_lock set v = v + 1 where id = 100")
+	require.ErrorIs(t, err, storeerr.ErrLockWaitTimeout)
+	contender.MustExec("rollback")
+	tk.MustQuery("select id, v from pessimistic_split_lock order by id").Check(testkit.Rows("1 10", "100 20"))
+	owner.MustExec("commit")
+	contender.MustExec("begin pessimistic")
+	contender.MustExec("update pessimistic_split_lock set v = v + 1 where id = 100")
+	contender.MustExec("commit")
+	tk.MustQuery("select id, v from pessimistic_split_lock order by id").Check(testkit.Rows("1 10", "100 21"))
+}
+
 func TestPessimisticTxn(t *testing.T) {
 	store := realtikvtest.CreateMockStoreAndSetup(t)
 
